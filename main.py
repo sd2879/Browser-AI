@@ -178,10 +178,9 @@ async def main():
         if not os.path.exists(images_dir):
             os.makedirs(images_dir)
 
-        # RUN IN NPX MODE     
+        # RUN IN NPX MODE (non-interactive)
         command = "npx"
-        args = ["@playwright/mcp@latest", 
-        "--output-dir=/images"]
+        args = ["--yes", "@playwright/mcp@latest", "--output-dir=/images"]
 
 
         # RUN BELOW ARGS WHENRUNNING IN SERVER (eg: WSL) IN HEADLESS MODE IN DOCKER
@@ -233,6 +232,30 @@ async def main():
         agent_tools_description = tools_description
 
         agent_chain = await create_agent(agent_tools)
+
+        # Prewarm path: initialize browser to reduce first-command latency
+        if os.getenv("PREWARM") == "1":
+            try:
+                # Install browsers if needed and open a blank tab to spin up context
+                logger.info("PREWARM enabled: running browser_install and opening prewarm tab")
+                try:
+                    install_result = await execute_tool_call(session, json.dumps({
+                        "tool_name": "browser_install",
+                        "arguments": {}
+                    }))
+                    logger.info(f"browser_install result: {json.dumps(install_result)}")
+                except Exception as e:
+                    logger.warning(f"browser_install failed or unnecessary: {e}")
+
+                prewarm_url = os.getenv("PREWARM_URL", "about:blank")
+                nav_result = await execute_tool_call(session, json.dumps({
+                    "tool_name": "browser_navigate",
+                    "arguments": {"url": prewarm_url}
+                }))
+                logger.info(f"Prewarm navigate result: {json.dumps(nav_result)}")
+            except Exception as e:
+                logger.warning(f"PREWARM failed: {e}")
+            # Keep running to accept user input from stdin (Electron pipes messages)
         tool_result = None 
         last_tool_call = None
         step = 0
@@ -241,6 +264,41 @@ async def main():
                 input_query = input("INPUT: ")
                 logger.info(f"STEP {step}: Starting new agent invocation for query: {input_query}")
                 step += 1
+                # Fast-path: direct navigation for common intents to reduce latency
+                try:
+                    iq = (input_query or "").strip()
+                    lower_iq = iq.lower()
+                    direct_url = None
+                    if iq.startswith("http://") or iq.startswith("https://"):
+                        direct_url = iq
+                    elif "." in iq and not iq.startswith("{") and " " not in iq:
+                        # looks like a bare domain
+                        direct_url = f"https://{iq}"
+                    else:
+                        import re
+                        m = re.match(r"^(go to|open|navigate to)\s+(.+)$", lower_iq)
+                        if m:
+                            # Use original case for URL part from the original input
+                            url_part = iq[len(m.group(1)):].strip()
+                            if url_part.startswith("http://") or url_part.startswith("https://"):
+                                direct_url = url_part
+                            elif "." in url_part and " " not in url_part:
+                                direct_url = f"https://{url_part}"
+                            else:
+                                # fall back to search query via google
+                                q = urllib.parse.quote(url_part)
+                                direct_url = f"https://www.google.com/search?q={q}"
+                    if direct_url:
+                        logger.info(f"Fast-path navigation to: {direct_url}")
+                        tool_result = await execute_tool_call(session, json.dumps({
+                            "tool_name": "browser_navigate",
+                            "arguments": {"url": direct_url}
+                        }))
+                        print(json.dumps(tool_result))
+                        await asyncio.sleep(0.2)
+                        continue
+                except Exception as e:
+                    logger.warning(f"Fast-path failed or not applicable: {e}")
                 intermediate_steps = []
                 # tool_result = None
                 done = False
